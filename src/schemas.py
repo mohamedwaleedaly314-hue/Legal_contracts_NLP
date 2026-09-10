@@ -16,6 +16,29 @@ class RiskLevel(str, Enum):
     GREEN = "أخضر"  # safe / compliant with the law
 
 
+class EvidenceStatus(str, Enum):
+    """Where the verdict's legal support actually came from.
+
+    The distinction the product lives or dies on. A model asked to judge a
+    clause will judge it either way; what changes is whether a retrieved
+    article backs the judgement. Without this field the UI printed "باطل
+    وفقاً للقانون المصري" in red over reasoning that cited articles the
+    retriever never returned - a confident-looking claim resting on the
+    model's memory. Recording the difference lets the caller state a verdict
+    only as strongly as its evidence allows.
+    """
+
+    GROUNDED = "مسند"          # every cited article was in the retrieved set
+    MODEL_KNOWLEDGE = "استنتاج"  # the model reached past the retrieved articles
+    INSUFFICIENT = "غير كاف"    # nothing relevant was retrieved to judge against
+
+
+class Confidence(str, Enum):
+    HIGH = "عالية"
+    MEDIUM = "متوسطة"
+    LOW = "منخفضة"
+
+
 class ClauseRiskAnalysis(BaseModel):
     clause_id: int = Field(description="رقم البند")
     clause_label: str = Field(description="عنوان أو مسمى البند")
@@ -31,8 +54,27 @@ class ClauseRiskAnalysis(BaseModel):
         description="درجة الخطورة من 1 (آمن جداً) إلى 10 (باطل ومجحف للغاية)"
     )
 
-    is_void_legal_term: bool = Field(
-        description="هل البند يعتبر باطلاً بطلاناً مطلقاً أو نسبياً وفقاً للقانون المصري؟"
+    # Optional on purpose: a bool forces a verdict even when the retrieved law
+    # does not settle the question, and "false" then reads as "lawful" when
+    # what it means is "could not tell". None is the honest third answer.
+    is_void_legal_term: Optional[bool] = Field(
+        default=None,
+        description=(
+            "هل البند باطل وفقاً للقانون المصري؟ "
+            "true إذا كانت إحدى المواد المرفقة تُبطله صراحةً، "
+            "false إذا كانت المواد المرفقة تجيزه، "
+            "null إذا كانت المواد المرفقة لا تحسم المسألة."
+        ),
+    )
+    evidence_status: EvidenceStatus = Field(
+        description=(
+            "مصدر السند: «مسند» إذا كان كل استشهاد من المواد المرفقة، "
+            "«استنتاج» إذا استندت إلى معرفتك خارجها، "
+            "«غير كاف» إذا لم تكن المواد المرفقة كافية للحكم."
+        )
+    )
+    confidence: Confidence = Field(
+        description="ثقتك في هذا التقييم: عالية أو متوسطة أو منخفضة"
     )
     cited_law_articles: List[str] = Field(
         description="أسماء وأرقام المواد القانونية المعتمد عليها المأخوذة من الـ RAG"

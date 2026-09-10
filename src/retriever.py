@@ -37,7 +37,16 @@ from qdrant_client.models import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DATA_DIR = PROJECT_ROOT / "data"
+# MIZAN_DATA_DIR lets a deployment mount the corpus somewhere else, and lets a
+# candidate corpus be benchmarked side by side with the live one before it
+# replaces anything. Relative values resolve against the repo root.
+_DATA_OVERRIDE = os.environ.get("MIZAN_DATA_DIR", "").strip()
+if _DATA_OVERRIDE:
+    DATA_DIR = Path(_DATA_OVERRIDE)
+    if not DATA_DIR.is_absolute():
+        DATA_DIR = PROJECT_ROOT / DATA_DIR
+else:
+    DATA_DIR = PROJECT_ROOT / "data"
 
 INDEX_DIR = DATA_DIR / "index"
 
@@ -50,6 +59,17 @@ EMBEDDINGS_PATH = DATA_DIR / "embeddings.npy"
 QDRANT_PATH = INDEX_DIR / "legal_rag_qdrant"
 
 COLLECTION_NAME = "egyptian_legal_articles_contract_types"
+
+
+# Whether the contract-type tag is used to narrow the search at all. See the
+# comment in dense_search. Off is right for a corpus whose type vocabulary
+# does not match the classifier's.
+# Default off: the shipped corpus tags articles with its own vocabulary
+# (lease / residential_lease / agency) which does not match the nine ids the
+# classifier emits, and 18% of its articles carry no "general" tag at all.
+# Filtering under those conditions cost 16 points of Recall@3 on the benchmark.
+# Set MIZAN_TYPE_FILTER=1 for a corpus whose tags match the classifier.
+TYPE_FILTER = os.environ.get("MIZAN_TYPE_FILTER", "0").strip().lower() not in {"0", "false", "no"}
 
 
 # ============================================================
@@ -270,7 +290,13 @@ def dense_search(
             # "general", and the civil code genuinely does govern all of
             # these contracts - so let relevance rank the corpus and let the
             # type tag lift its own articles rather than exclude the rest.
-            FieldCondition(
+            #
+            # Whether to filter at all is a property of the corpus, not of the
+            # query: a corpus whose type vocabulary differs from the
+            # classifier's (lease / residential_lease rather than residential)
+            # or whose articles do not all carry "general" gets starved by any
+            # filter. MIZAN_TYPE_FILTER=0 turns it off for such a corpus.
+            *([FieldCondition(
 
                 key="contract_types",
 
@@ -281,7 +307,7 @@ def dense_search(
                     ]
                 ),
 
-            ),
+            )] if TYPE_FILTER else []),
 
             FieldCondition(
 
@@ -361,7 +387,7 @@ def bm25_search(
         # legal_articles.json shipped without contract_types, so every article
         # defaulted to ["general"], failed a strict "residential" test, and the
         # sparse half of the hybrid search returned nothing for every query.
-        if not article_types & {contract_type, "general"}:
+        if TYPE_FILTER and not article_types & {contract_type, "general"}:
 
             continue
 

@@ -36,6 +36,7 @@ from typing import Callable, List, Optional
 
 from . import ocr as ocr_module
 from . import classifier as classifier_module
+from .legal_concepts import legal_concepts
 from .legal_text import clean_articles
 
 logger = logging.getLogger("contract_ai.orchestrator")
@@ -92,8 +93,40 @@ def retriever_status() -> dict:
 # --------------------------------------------------------------------------
 # Retrieval
 # --------------------------------------------------------------------------
+def _article_key(article: dict) -> tuple:
+    """Identity for fusing lists that came from different queries."""
+    return (article.get("law_name"), str(article.get("article_number")))
+
+
+def _rrf(ranked_lists: List[List[dict]], k: int = 60) -> List[dict]:
+    """Reciprocal rank fusion over several ranked article lists.
+
+    Same formula the retriever already uses internally to combine dense with
+    BM25; applied one level up to combine the results of different *queries*.
+    """
+    scores: dict = {}
+    seen: dict = {}
+    for ranked in ranked_lists:
+        for rank, article in enumerate(ranked, start=1):
+            key = _article_key(article)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            seen.setdefault(key, article)
+
+    order = sorted(scores, key=lambda key: -scores[key])
+    return [seen[key] for key in order]
+
+
 def retrieve_for_clause(clause_text: str, contract_type: str, top_k: int) -> List[dict]:
     """Legal articles governing one clause. Returns [] when unavailable.
+
+    The clause is searched twice. Once as written, which finds the article
+    that reads like it - and once as the abstract legal question it raises,
+    which is the only way to reach the general provisions that actually decide
+    nullity. Measured: clauses governed by a topic article scored Recall@3 62%,
+    clauses governed by a general principle 40%, and article 149 never
+    surfaced at all for the four clauses it governs. Those articles share no
+    vocabulary with the clause, so reranking a candidate list cannot help -
+    they were never in it. See legal_concepts.py.
 
     exclude_penalty=False on purpose: the retriever drops penalty provisions
     because it was written for the drafting flow, but a void or abusive
@@ -103,16 +136,24 @@ def retrieve_for_clause(clause_text: str, contract_type: str, top_k: int) -> Lis
     if retriever is None:
         return []
 
-    try:
-        articles = retriever.retrieve(
-            clause_text=clause_text,
-            contract_type=contract_type,
-            top_k=top_k,
-            exclude_penalty=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Retrieval failed for a clause: %s", exc)
-        return []
+    def search(query: str) -> List[dict]:
+        try:
+            return retriever.retrieve(
+                clause_text=query,
+                contract_type=contract_type,
+                # Over-fetch so fusion has something to work with, then trim.
+                top_k=max(top_k * 2, 6),
+                exclude_penalty=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Retrieval failed for a query: %s", exc)
+            return []
+
+    ranked = [search(clause_text)]
+    for concept in legal_concepts(clause_text):
+        ranked.append(search(concept))
+
+    articles = _rrf(ranked)[:top_k] if len(ranked) > 1 else ranked[0][:top_k]
 
     # The corpus was itself OCR'd and 58% of it is damaged. Repair it here,
     # once, so both the model's context and the article shown under the clause
@@ -187,6 +228,75 @@ def verify_citations(cited: List[str], articles: List[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Evidence settlement
+# --------------------------------------------------------------------------
+EVIDENCE_LABELS = {
+    "grounded": "مسند إلى المواد المسترجعة",
+    "model_knowledge": "استنتاج من معرفة النموذج",
+    "insufficient": "لا توجد مواد كافية للحكم",
+}
+
+
+def _settle_evidence(result: dict, check: dict, articles: List[dict]) -> dict:
+    """Decide how strongly this verdict is allowed to be stated.
+
+    The model self-reports `evidence_status`, and it has every incentive to be
+    generous with itself. verify_citations already knows, mechanically, whether
+    the articles it cited were actually in front of it - so the claim is
+    checked against that rather than taken at face value, and the two are
+    reconciled by taking the weaker of them.
+
+    The consequence that matters: `is_void` survives only when the evidence is
+    grounded. A model asserting "باطل" from memory still gets its reasoning
+    shown and its risk score kept, but the UI stops printing a legal ruling
+    over it.
+    """
+    declared = result.get("evidence_status")
+    declared = getattr(declared, "value", declared)
+    confidence = result.get("confidence")
+    confidence = getattr(confidence, "value", confidence)
+
+    # Mechanical reading of the same question, independent of what was claimed.
+    if not articles:
+        observed = "insufficient"
+    elif check["unverified"] and not check["verified"]:
+        observed = "model_knowledge"
+    elif check["verified"]:
+        observed = "grounded"
+    else:
+        observed = "insufficient"  # cited nothing at all
+
+    declared_map = {
+        "مسند": "grounded",
+        "استنتاج": "model_knowledge",
+        "غير كاف": "insufficient",
+    }
+    claimed = declared_map.get(declared, observed)
+
+    # Take the weaker of the two readings.
+    rank = {"grounded": 2, "model_knowledge": 1, "insufficient": 0}
+    status = min(claimed, observed, key=lambda s: rank[s])
+
+    is_void = result.get("is_void_legal_term")
+    note = None
+    if is_void and status != "grounded":
+        is_void = None
+        note = (
+            "رجّح التحليل بطلان هذا البند، لكن لم تُسند المواد المسترجعة هذا "
+            "الحكم — فهو مؤشر خطورة يستدعي مراجعة محامٍ، لا حكماً بالبطلان."
+        )
+    elif status == "insufficient":
+        note = "لم تُسترجع مواد قانونية متصلة بهذا البند، والتقييم اجتهادي."
+
+    return {
+        "is_void": is_void,
+        "status": status,
+        "note": note,
+        "confidence": confidence or ("عالية" if status == "grounded" else "منخفضة"),
+    }
+
+
+# --------------------------------------------------------------------------
 # Per-clause work
 # --------------------------------------------------------------------------
 def _process_clause(clause: dict, metadata: dict, contract_type: str, top_k: int) -> dict:
@@ -218,6 +328,10 @@ def _process_clause(clause: dict, metadata: dict, contract_type: str, top_k: int
             "risk_ar": "غير محدد",
             "risk_score": None,
             "is_void": None,
+            "is_void_claimed": None,
+            "evidence_status": "insufficient",
+            "evidence_note": None,
+            "confidence": None,
             "reasoning_steps": [],
             "simple_explanation": "",
             "legal_rationale": "",
@@ -234,18 +348,29 @@ def _process_clause(clause: dict, metadata: dict, contract_type: str, top_k: int
     risk_ar = result.get("risk_level")
     risk_ar = getattr(risk_ar, "value", risk_ar)
 
+    cited = result.get("cited_law_articles", [])
+    check = verify_citations(cited, articles)
+    evidence = _settle_evidence(result, check, articles)
+
     return {
         **base,
         "risk": RISK_COLOURS.get(risk_ar, "unknown"),
         "risk_ar": risk_ar,
         "risk_score": result.get("risk_score"),
-        "is_void": result.get("is_void_legal_term"),
+        # The declared verdict, kept for the record...
+        "is_void_claimed": result.get("is_void_legal_term"),
+        # ...and the one the UI is allowed to state, which the evidence has to
+        # earn. See _settle_evidence.
+        "is_void": evidence["is_void"],
+        "evidence_status": evidence["status"],
+        "evidence_note": evidence["note"],
+        "confidence": evidence["confidence"],
         "reasoning_steps": result.get("reasoning_steps", []),
         "simple_explanation": result.get("simple_explanation", ""),
         "legal_rationale": result.get("legal_rationale", ""),
         "suggestion": result.get("suggested_balanced_clause"),
-        "cited_law_articles": result.get("cited_law_articles", []),
-        "citation_check": verify_citations(result.get("cited_law_articles", []), articles),
+        "cited_law_articles": cited,
+        "citation_check": check,
         "error": None,
     }
 

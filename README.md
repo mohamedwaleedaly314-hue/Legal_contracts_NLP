@@ -119,6 +119,72 @@ setting to change — it does not report a dozen mysterious clause failures.
 
 ---
 
+## Reaching the article that actually governs a clause
+
+Retrieval finds the article that *reads like* the clause. The articles that
+decide whether a clause is void do not read like it, and that gap was the
+largest single accuracy problem in the system.
+
+Measured on the 40-clause benchmark: clauses governed by a topic article
+(lease, sale) reached Recall@3 62%; clauses governed by a general principle of
+contract law reached 40%. Article 149 — abusive terms in an adhesion contract,
+the provision this product leans on most — was never retrieved once for any of
+the four clauses it governs.
+
+That is not a ranking failure, so a reranker cannot fix it. A clause says
+`يتنازل المستأجر عن حقه في اللجوء إلى القضاء`; article 149 says `إذا تم العقد
+بطريق الإذعان وكان قد تضمن شروطاً تعسفية`. They share almost no vocabulary. The
+article was never a candidate to be reranked.
+
+So `orchestrator.retrieve_for_clause` searches twice: once with the clause as
+written, and once with the abstract legal question it raises, fusing the two
+with RRF. `legal_concepts.py` derives the second query by rule — the mapping is
+small, it is the part a lawyer would want to audit, and it costs no quota.
+
+| | Recall@3 | Recall@10 |
+|---|---|---|
+| general principle — before | 40.0% | 46.7% |
+| general principle — after | **66.7%** | **80.0%** |
+| topic-specific — before | 62.0% | 76.0% |
+| topic-specific — after | 62.0% | 78.0% |
+| **overall** | 53.8% → **63.7%** | 65.0% → **78.8%** |
+
+Zero regressions, and clauses where no rule fires are byte-identical to before:
+the second query is only spent when the clause raises an issue that needs it.
+
+---
+
+## How strongly a verdict is stated
+
+A model asked whether a clause is void will answer either way. What changes is
+whether a retrieved article backs the answer — and that is the difference the
+product lives on, so it is recorded rather than assumed.
+
+Every clause carries an `evidence_status`:
+
+| status | meaning | what the UI does |
+|---|---|---|
+| `grounded` | every article cited was in the retrieved set | may state **باطل** |
+| `model_knowledge` | the model reached past the retrieved articles | states a risk, not a ruling |
+| `insufficient` | nothing relevant was retrieved | states a risk, flags the gap |
+
+The model self-reports its status in the response, but `_settle_evidence` does
+not take that at face value: `verify_citations` already knows mechanically
+whether the cited articles were in front of it, and the weaker of the two
+readings wins.
+
+The consequence is deliberate. `is_void_legal_term` is `Optional[bool]` — a
+plain bool forces a verdict where the law retrieved does not settle one, and
+`false` then reads as "lawful" when it means "could not tell". A claim of
+nullity that the evidence does not support is downgraded to `None`, the
+reasoning and risk score are still shown, and a note explains why the ruling
+was withheld:
+
+> رجّح التحليل بطلان هذا البند، لكن لم تُسند المواد المسترجعة هذا الحكم — فهو
+> مؤشر خطورة يستدعي مراجعة محامٍ، لا حكماً بالبطلان.
+
+---
+
 ## Scanned contracts
 
 A scan of a justified Arabic page is the hard case. The kashida — the stroke
@@ -127,7 +193,12 @@ so `الطرف` arrives as `الطدددددرف`, fifty times a page. On top of
 one-letter fragments and a set of consistent letter confusions
 (`ل`→`و`, `ص`→`د`, `ت`→`ه`, `ع`→`ى`).
 
-`ocr.py` handles this in two passes:
+Tesseract runs in `--psm 6` ("a single uniform block of text") rather than
+`psm 3`: a contract page is one justified column, and psm 3's layout analysis
+hunts for columns that are not there and mis-slices the line. PDF pages are
+rasterised by PyMuPDF in-process, so no Poppler.
+
+`ocr.py` then handles the damage in two passes:
 
 1. `repair_scan_artifacts` — deterministic. Collapses kashida runs, unglues
    digits from words, and rejoins lines the page layout broke mid-sentence.
@@ -153,11 +224,15 @@ and saved.
 
 ## Dependencies that are not pip packages
 
-Both are optional; the app degrades rather than failing.
+Only one, and only for scanned input:
 
-- **Tesseract OCR** + the `ara` language pack — only for scanned PDFs and
-  images. PDFs with a text layer are read directly by PyMuPDF.
-- **Poppler** — only for scanned PDFs (`pdf2image`).
+- **Tesseract OCR** + the `ara` language pack — needed for scanned PDFs and
+  images. PDFs that carry a text layer are read directly by PyMuPDF and need
+  nothing extra.
+
+Poppler is no longer required: PyMuPDF renders PDF pages to images in-process,
+so `pip install -r requirements.txt` is the whole setup. `pdf2image` remains
+in the requirements only as a fallback for a file PyMuPDF cannot render.
 
 ---
 

@@ -11,9 +11,9 @@ streamlit>=1.36
 pymupdf>=1.24          # PDF text layer - no external binary needed
 python-docx>=1.1
 pillow>=10.0
-opencv-python>=4.9     # contrast boost before OCR
+opencv-python-headless>=4.9 # contrast boost before OCR (headless for cloud deployment)
 pytesseract>=0.3.10    # needs the Tesseract binary + ara language pack
-pdf2image>=1.17        # needs Poppler on PATH (scanned PDFs only)
+pdf2image>=1.17        # optional fallback; PyMuPDF renders PDFs in-process
 
 # --- Stage 3: RAG retrieval ---
 numpy>=1.26,<3

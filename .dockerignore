@@ -1,0 +1,30 @@
+# Secrets - the Dockerfile does `COPY . /app`, so without this line the real
+# .env (API key included) is baked into every layer of the published image.
+.env
+.env.*
+!.env.example
+
+# Version control and local tooling
+.git
+.gitignore
+.claude
+.vscode
+.idea
+
+# Python noise
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Local artefacts that must not ship
+outputs/
+backup/
+eval/results/
+notebooks/
+*.log
+
+# The model cache is baked in a build stage instead - see the Dockerfile
+.cache/

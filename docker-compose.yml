@@ -1,24 +1,69 @@
-version: '3.8'
-services:
-  qdrant:
-    image: qdrant/qdrant:1.6.0
-    restart: unless-stopped
-    volumes:
-      - ./index/legal_rag_qdrant:/qdrant/storage
-      - ./data:/app/data
-    ports:
-      - "6333:6333"
-    command: ["--storage-dir", "/qdrant/storage"]
+# Mizan — container setup.
+#
+#   docker compose up --build                      app only, embedded Qdrant
+#   docker compose --profile server up --build     app + a real Qdrant service
+#
+# Why two modes rather than one:
+#
+# The previous compose file mounted the index folder into a Qdrant *server*.
+# That cannot work. `qdrant-client` in local mode writes a single SQLite file
+# with a `points` table; a Qdrant server stores collections as segments and a
+# write-ahead log. Handing the server the client's SQLite gives it a directory
+# it does not recognise, the collection silently does not exist, and every
+# clause comes back with no legal articles - which reads as a bad model rather
+# than a bad mount.
+#
+# So the default is honest and simple: one container, embedded Qdrant, exactly
+# how the app runs locally. Streamlit is single-process, so the folder lock
+# that mode takes is not a constraint.
+#
+# The `server` profile is for when it becomes one - more than one worker, or a
+# managed Qdrant. It needs the collection loaded into the server first:
+#
+#   docker compose --profile server up -d qdrant
+#   QDRANT_URL=http://localhost:6333 python -m scripts.load_qdrant_server
 
+services:
   app:
     build: .
     restart: unless-stopped
     env_file: .env
     environment:
-      - QDRANT_URL=http://qdrant:6333
+      # Set by the `server` profile; empty means embedded mode.
+      - QDRANT_URL=${QDRANT_URL:-}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      # Baked into the image at build time - see the Dockerfile.
+      - HF_HOME=/opt/models
     ports:
       - "8501:8501"
     volumes:
-      - ./:/app
-    depends_on:
-      - qdrant
+      # The corpus, so a rebuilt index does not require a rebuilt image.
+      - ./data:/app/data:ro
+    healthcheck:
+      # --no-qdrant so the check never contends for the embedded folder lock.
+      test: ["CMD", "python", "-m", "src.preflight", "--json", "--no-qdrant"]
+      interval: 30s
+      timeout: 20s
+      # Generous: a cold start loads a 2.2 GB model, and a healthcheck that
+      # fires before that finishes would restart a container that is fine.
+      start_period: 180s
+      retries: 3
+
+  qdrant:
+    profiles: ["server"]
+    image: qdrant/qdrant:v1.12.1
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      # The server's own storage format - deliberately NOT the client's
+      # index folder. Populate it with scripts/load_qdrant_server.py.
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  qdrant_storage:

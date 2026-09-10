@@ -19,6 +19,7 @@ Public API:
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import logging
@@ -38,8 +39,14 @@ except ImportError:
     HAS_FITZ = False
 
 try:
-    import pytesseract
     from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    Image = None
+    HAS_PIL = False
+
+try:
+    import pytesseract
     # Windows installs Tesseract outside PATH; TESSERACT_CMD overrides.
     _tess_cmd = os.environ.get("TESSERACT_CMD")
     if _tess_cmd:
@@ -154,9 +161,24 @@ _REFINE_PROMPT = """أنت مدقق نصوص قانونية عربية، ومه�
 {raw_text}"""
 
 
+def _groq_key() -> str:
+    """The key, from settings rather than the raw environment.
+
+    os.environ alone is not enough: .env is loaded by config, and this module
+    is imported before it on some paths (the benchmark hit exactly that).
+    Reading the environment directly then found nothing, refinement silently
+    no-opped, and the caller got raw OCR back believing it had been cleaned -
+    the same silent-skip failure the wrong model ids caused earlier.
+    """
+    try:
+        from .config import settings
+        return settings.groq_api_key or os.environ.get("GROQ_API_KEY", "")
+    except Exception:  # noqa: BLE001 - config is optional for this module
+        return os.environ.get("GROQ_API_KEY", "")
+
+
 def groq_available() -> bool:
-    key = os.environ.get("GROQ_API_KEY", "")
-    return HAS_GROQ and key.startswith("gsk_")
+    return HAS_GROQ and _groq_key().startswith("gsk_")
 
 
 def _split_for_refinement(text: str, limit: int = MAX_REFINE_CHARS) -> List[str]:
@@ -216,7 +238,7 @@ def refine_text_with_groq(raw_text: str) -> str:
         return raw_text
 
     try:
-        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        client = Groq(api_key=_groq_key())
         return "\n\n".join(
             _refine_chunk(client, chunk) for chunk in _split_for_refinement(raw_text)
         )
@@ -238,7 +260,12 @@ def preprocess_image_for_ocr(pil_img):
     return Image.fromarray(clahe.apply(gray))
 
 
-TESS_CONFIG = r"--oem 3 --psm 3 -l ara+eng"
+# psm 6 - "assume a single uniform block of text" - rather than psm 3's full
+# automatic page segmentation. A contract page is one justified column, and
+# psm 3's layout analysis on justified Arabic is fragile: it hunts for columns
+# that are not there and mis-slices the line, which is part of how the kashida
+# stretch ends up read as a row of dals.
+TESS_CONFIG = r"--oem 3 --psm 6 -l ara+eng"
 
 
 def _ocr_image(pil_img) -> str:
@@ -270,14 +297,42 @@ def extract_pdf_text_layer(pdf_path: str) -> List[str]:
     return pages
 
 
+def rasterize_pdf(pdf_path: str, dpi: int = 300) -> List["Image.Image"]:
+    """Render each PDF page to an image.
+
+    PyMuPDF first: it is already a dependency (the text-layer path uses it) and
+    it renders in-process, so a scanned PDF no longer needs Poppler installed
+    on the machine - which was the one system package standing between this
+    pipeline and a plain `pip install`. pdf2image stays as a fallback for the
+    rare file PyMuPDF cannot render.
+    """
+    if HAS_FITZ:
+        try:
+            images = []
+            with fitz.open(pdf_path) as doc:
+                for page in doc:
+                    pix = page.get_pixmap(dpi=dpi)
+                    images.append(
+                        Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                    )
+            if images:
+                return images
+            logger.warning("PyMuPDF rendered no pages from %s", pdf_path)
+        except Exception as exc:  # noqa: BLE001 - fall through to pdf2image
+            logger.warning("PyMuPDF could not rasterise %s: %s", pdf_path, exc)
+
+    if HAS_PDF2IMAGE:
+        return convert_from_path(pdf_path, dpi=dpi)
+
+    raise RuntimeError(
+        "تعذر تحويل ملف PDF إلى صور: PyMuPDF غير متاح ولا pdf2image. "
+        "ثبّت pymupdf عبر pip."
+    )
+
+
 def extract_pdf_ocr(pdf_path: str, dpi: int = 300, refine: bool = True) -> List[str]:
-    """Rasterise then OCR - for scanned PDFs. Needs Poppler + Tesseract."""
-    if not HAS_PDF2IMAGE:
-        raise RuntimeError(
-            "pdf2image غير متاح (ويحتاج Poppler مثبتاً على النظام) "
-            "— لا يمكن تشغيل OCR على ملف PDF ممسوح ضوئياً."
-        )
-    images = convert_from_path(pdf_path, dpi=dpi)
+    """Rasterise then OCR - for scanned PDFs. Needs Tesseract."""
+    images = rasterize_pdf(pdf_path, dpi=dpi)
     logger.info("OCR over %d page(s)", len(images))
 
     page_texts = []

@@ -36,6 +36,17 @@ RISK_META = {
 }
 RISK_ORDER = ["red", "yellow", "green", "unknown"]
 
+# Short labels for where a verdict's legal support came from. The risk colour
+# says how bad the clause is; this says how much the reader should trust that
+# reading. They are different questions and get separate badges.
+EVIDENCE_SHORT = {"grounded": "✔︎", "model_knowledge": "◐", "insufficient": "○"}
+
+EVIDENCE_BADGE = {
+    "grounded": "✔︎ مسند إلى القانون المسترجع",
+    "model_knowledge": "◐ استنتاج غير مسند",
+    "insufficient": "○ سند غير كافٍ",
+}
+
 STAGE_LABELS = {
     "ocr": "استخراج النص",
     "classify": "تحديد نوع العقد",
@@ -176,6 +187,21 @@ section[data-testid="stSidebar"] { direction: rtl; text-align: right; }
   display: inline-block; margin-top: .4rem; font-size: .8rem; font-weight: 700;
   color: #B3261E; background: #fff; border: 1px solid #F3C9C4;
   border-radius: 6px; padding: .14rem .5rem;
+}
+/* Where the verdict's support came from - shown on every clause, so the
+   reader never has to assume a ruling is backed by the retrieved law. */
+.ev {
+  display: inline-block; margin-top: .4rem; margin-left: .35rem;
+  font-size: .76rem; font-weight: 700; border-radius: 6px;
+  padding: .14rem .55rem; border: 1px solid transparent;
+}
+.ev-grounded        { color:#1E6B45; background:#EAF6EF; border-color:#C6E4D3; }
+.ev-model_knowledge { color:#B26A00; background:#FFF6E5; border-color:#F0DCB4; }
+.ev-insufficient    { color:#5F6B76; background:#F1F3F5; border-color:#DFE4E8; }
+.ev-note {
+  margin-top: .45rem; font-size: .83rem; line-height: 1.85; color: #5A6772;
+  background: #FFF6E5; border-right: 3px solid #B26A00;
+  border-radius: 6px; padding: .5rem .7rem;
 }
 
 .label { font-weight: 700; color: var(--ink); font-size: .93rem; margin: .95rem 0 .35rem; }
@@ -469,15 +495,30 @@ def render_clause(clause: dict) -> None:
     title = clause["label"] or f"بند {clause['id']}"
     badge = meta["label"] + (f" · {score}/10" if score is not None else "")
     excerpt = clause.get("simple_explanation") or clause["text"]
+
+    # "باطل" is a legal ruling, so it appears only when the orchestrator was
+    # able to tie it to a retrieved article. An ungrounded claim of nullity
+    # arrives here as is_void=None with a note explaining why.
     void = ("<div class='void-flag'>⚠️ باطل وفقاً للقانون المصري</div>"
             if clause.get("is_void") else "")
+
+    status = clause.get("evidence_status") or "insufficient"
+    evidence = (
+        f"<div class='ev ev-{status}'>"
+        f"{html.escape(EVIDENCE_BADGE.get(status, status))}</div>"
+        if clause.get("risk") != "unknown" else ""
+    )
+    note = (
+        f"<div class='ev-note'>{html.escape(clause['evidence_note'])}</div>"
+        if clause.get("evidence_note") else ""
+    )
 
     st.markdown(
         f"<div class='clause-head' style='--rc:{meta['colour']};--bg:{meta['soft']}'>"
         f"<div class='badge'>{html.escape(badge)}</div>"
         f"<div class='t'><b>{html.escape(title)}</b>"
         f"<span>{html.escape(excerpt[:200])}{'…' if len(excerpt) > 200 else ''}</span>"
-        f"{void}</div></div>",
+        f"{void}{evidence}{note}</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -578,6 +619,7 @@ def build_html_report(report: dict) -> str:
         f"{RISK_META.get(c['risk'], RISK_META['unknown'])['label']}</span></td>"
         f"<td class='n'>{c['risk_score'] if c.get('risk_score') is not None else '—'}</td>"
         f"<td class='n'>{'نعم' if c.get('is_void') else '—'}</td>"
+        f"<td class='n'>{EVIDENCE_SHORT.get(c.get('evidence_status'), '—')}</td>"
         "</tr>"
         for i, c in enumerate(clauses, 1)
     )
@@ -614,6 +656,17 @@ def build_html_report(report: dict) -> str:
         )
         void = ("<p class='void'>هذا البند يُعد باطلاً وفقاً للقانون المصري.</p>"
                 if clause.get("is_void") else "")
+        status = clause.get("evidence_status") or "insufficient"
+        evidence = (
+            f"<p class='ev ev-{status}'>السند: "
+            f"{html.escape(EVIDENCE_BADGE.get(status, status))}"
+            + (f" · الثقة: {html.escape(clause['confidence'])}"
+               if clause.get("confidence") else "")
+            + "</p>"
+        )
+        if clause.get("evidence_note"):
+            evidence += f"<p class='ev-note'>{html.escape(clause['evidence_note'])}</p>"
+
         explanation = (
             f"<p class='plain'>{html.escape(clause['simple_explanation'])}</p>"
             if clause.get("simple_explanation") else ""
@@ -629,7 +682,7 @@ def build_html_report(report: dict) -> str:
             f"<h3><span class='pill' style='background:{meta['colour']}'>"
             f"{meta['label']}{score_text}</span>"
             f"{html.escape(clause['label'] or ('بند ' + str(clause['id'])))}</h3>"
-            f"{void}{explanation}"
+            f"{void}{evidence}{explanation}"
             "<h4>نص البند كما ورد في العقد</h4>"
             f"<blockquote>{html.escape(clause['text'])}</blockquote>"
             f"{rationale}"
@@ -716,6 +769,13 @@ def build_html_report(report: dict) -> str:
   section.clause h3 {{ margin: 0 0 .5rem; font-size: 1.02rem; }}
   .plain {{ margin: .3rem 0 .6rem; }}
   .void {{ color: #B3261E; font-weight: 700; margin: .2rem 0 .5rem; }}
+  .ev {{ display: inline-block; font-size: .82rem; font-weight: 700; margin: .3rem 0;
+         border-radius: 6px; padding: .15rem .6rem; border: 1px solid transparent; }}
+  .ev-grounded {{ color:#1E6B45; background:#EAF6EF; border-color:#C6E4D3; }}
+  .ev-model_knowledge {{ color:#B26A00; background:#FFF6E5; border-color:#F0DCB4; }}
+  .ev-insufficient {{ color:#5F6B76; background:#F1F3F5; border-color:#DFE4E8; }}
+  .ev-note {{ background:#FFF6E5; border-right:3px solid #B26A00; padding:.55rem .8rem;
+              border-radius:6px; font-size:.88rem; margin:.4rem 0; }}
   blockquote {{ margin: 0; background: #fff; border: 1px solid var(--line);
                 padding: .8rem 1rem; border-radius: 8px; }}
   .art {{ background: #F3F7FA; border-right: 4px solid var(--brand);
@@ -776,7 +836,7 @@ def build_html_report(report: dict) -> str:
 
   <h2>فهرس البنود</h2>
   <table class="index">
-    <tr><th>#</th><th>البند</th><th>التقييم</th><th>الدرجة</th><th>باطل</th></tr>
+    <tr><th>#</th><th>البند</th><th>التقييم</th><th>الدرجة</th><th>باطل</th><th>السند</th></tr>
     {index_rows}
   </table>
 
@@ -856,6 +916,35 @@ def render_report(report: dict) -> None:
     with st.expander("⏱️ تفاصيل التنفيذ والنص المستخرج"):
         st.json(report["timings"])
         st.text_area("النص بعد التنظيف", report["clean_text"], height=240)
+
+
+# ==========================================================================
+# Preflight - a misconfigured deployment says so, up front
+# ==========================================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def _preflight() -> dict:
+    """Cached: the checks are cheap but not free, and Streamlit reruns often."""
+    from src.preflight import run
+    # Skip the Qdrant probe: the app process already holds the embedded
+    # folder's lock, so opening it a second time would report a failure the
+    # check itself caused.
+    return run(include_qdrant=False).to_dict()
+
+
+_status = _preflight()
+if not _status["ok"]:
+    st.error("⚠️ إعداد النشر غير مكتمل — التطبيق لن يعمل بشكل صحيح:", icon="⚠️")
+    for check in _status["checks"]:
+        if check["status"] == "fail":
+            st.markdown(f"**{check['name']}** — {check['message']}")
+            if check["hint"]:
+                st.caption(f"↳ {check['hint']}")
+    st.stop()
+
+for _check in _status["checks"]:
+    if _check["status"] == "warn":
+        st.warning(f"{_check['message']}"
+                   + (f" — {_check['hint']}" if _check["hint"] else ""), icon="ℹ️")
 
 
 # ==========================================================================

@@ -7,10 +7,8 @@ outputs/
 .streamlit/secrets.toml
 .claude/
 
-# Local qdrant/index storage and generated embeddings
-index/
-data/index/
-data/embeddings.npy
-data/bm25.pkl
-data/*.npy
-data/*.pkl
+# Local storage and generated files
+# (Note: data/index, data/embeddings.npy, data/bm25.pkl are included for cloud deployment)
+eval/results/
+backup/
+rag/
