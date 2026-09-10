@@ -28,6 +28,16 @@ try:
 except ImportError:  # python-dotenv is optional; real env vars still work
     pass
 
+# Also sync Streamlit Cloud Secrets (st.secrets) into os.environ if running inside Streamlit
+try:
+    import streamlit as _st
+    if hasattr(_st, "secrets"):
+        for _k, _v in _st.secrets.items():
+            if isinstance(_v, str) and _k not in os.environ:
+                os.environ[_k] = _v
+except Exception:
+    pass
+
 
 def _env_float(name: str, default: float) -> float:
     val = os.getenv(name)
