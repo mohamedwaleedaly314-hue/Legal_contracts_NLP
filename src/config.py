@@ -103,7 +103,9 @@ class Settings:
     # llama-3.3-70b, whose own limit is 12,000 - which is the number that
     # actually binds. At ~2,000 tokens a clause that is roughly six clauses a
     # minute, so more than two in flight only produces collisions and backoff.
-    max_concurrent_clauses: int = _env_int("CONTRACT_AI_MAX_CONCURRENCY", 2)
+    max_concurrent_clauses: int = _env_int(
+        "CONTRACT_AI_MAX_CONCURRENCY", 1 if PROVIDER == "groq" else 2
+    )
 
     # Tokens-per-minute ceiling the client paces itself against. Must match the
     # active model's real limit: 8,000 for the qwen3/gpt-oss models, 12,000 for
@@ -113,23 +115,14 @@ class Settings:
         "CONTRACT_AI_TPM", 8000 if PROVIDER == "groq" else 1_000_000
     )
 
-    # Output-token pacing, off by default (0 disables it).
-    #
-    # qwen3.8-27b advertises 1,000 output tokens a minute, but that is not
-    # enforced as a rolling sum: a completed run put 9,420 output tokens
-    # through in four minutes without a single output-limit refusal. What Groq
-    # actually checks is the ceiling each request declares, which is what
-    # max_output_tokens below is for. Pacing at the advertised 1,000 would cut
-    # throughput to one clause a minute and buy nothing - so set this only if
-    # output refusals ever show up despite max_output_tokens.
-    output_tokens_per_minute: int = _env_int("CONTRACT_AI_OTPM", 0)
+    # Output-token pacing (Groq enforces 1,000 OTPM ceiling on free tier).
+    output_tokens_per_minute: int = _env_int(
+        "CONTRACT_AI_OTPM", 900 if PROVIDER == "groq" else 0
+    )
 
-    # Declared ceiling on the reply. Groq checks *this* number against the
-    # remaining output budget before running the request, so leaving it unset
-    # means the model's own 2,048 maximum gets checked and the request is
-    # refused. A clause analysis returns about 785 tokens, so 900 leaves room
-    # without ever tripping the check.
-    max_output_tokens: int = _env_int("CONTRACT_AI_MAX_OUTPUT", 900)
+    # Declared ceiling on the reply. Groq checks this against the remaining
+    # OTPM budget (1,000 limit). Declaring 650 leaves room without tripping the check.
+    max_output_tokens: int = _env_int("CONTRACT_AI_MAX_OUTPUT", 650)
 
     request_timeout_s: float = _env_float("CONTRACT_AI_TIMEOUT_S", 120.0)
 
